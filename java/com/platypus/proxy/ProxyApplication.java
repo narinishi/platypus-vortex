@@ -120,8 +120,9 @@ public class ProxyApplication {
                 logger.Warning("Both --warp and --http2 specified; --warp takes precedence, ignoring --http2");
             }
             logger.Info("Starting WARP forward proxy on %s", bindAddress);
-            var tunnelOpener = new WarpProvider().initialize(cliArgs, logger);
-            WarpServe warpServe = new WarpServe(bindAddress, tunnelOpener, vtExecutor);
+            var warpProvider = new WarpProvider();
+            var tunnelOpener = warpProvider.initialize(cliArgs, logger);
+            WarpServe warpServe = new WarpServe(bindAddress, tunnelOpener, vtExecutor, warpProvider.getConnectionCloser());
 
             CountDownLatch latch = new CountDownLatch(1);
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {

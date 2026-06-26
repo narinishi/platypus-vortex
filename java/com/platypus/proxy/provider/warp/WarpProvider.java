@@ -1,6 +1,7 @@
 package com.platypus.proxy.provider.warp;
 
 import com.platypus.proxy.CLIArgs;
+import com.platypus.proxy.io.warp.TunnelConnection;
 import com.platypus.proxy.io.warp.TunnelOpener;
 import com.platypus.proxy.logging.CondLogger;
 import com.platypus.proxy.provider.RetryStrategy;
@@ -31,6 +32,18 @@ public class WarpProvider {
     private static final String DEFAULT_MODEL = "PC";
     private static final String DEFAULT_LOCALE = "en_US";
     private static final String DEFAULT_NAME = "platypus";
+
+    private volatile AtomicReference<AutoCloseable> delegateRef;
+
+    public Runnable getConnectionCloser() {
+        AtomicReference<AutoCloseable> ref = delegateRef;
+        return () -> {
+            Object current = ref != null ? ref.get() : null;
+            if (current instanceof AutoCloseable c) {
+                try { c.close(); } catch (Exception ignored) {}
+            }
+        };
+    }
 
     /**
      * NON-LEAK: Always tunneled through WARP H3 CONNECT. Returns a TunnelOpener
@@ -86,28 +99,26 @@ public class WarpProvider {
 
         logger.Info("Establishing WARP MASQUE connection to %s...", finalConfig.getEndpoint());
         WarpConnection primaryConnection = connectWithRetry(finalConfig, finalSocks5Url, logger, args);
-        AtomicReference<AutoCloseable> delegateRef = new AtomicReference<>(primaryConnection);
+        this.delegateRef = new AtomicReference<>(primaryConnection);
         AtomicReference<WarpConnectionKiche> kicheRef = new AtomicReference<>(null);
 
-        return (host, port) -> {
+        return (host, port, initialData) -> {
             Object current = delegateRef.get();
             if (current instanceof WarpConnection flupkeConn) {
                 try {
-                    return flupkeConn.openTunnel(host, port);
+                    return flupkeConn.openTunnel(host, port, initialData);
                 } catch (IOException e) {
                     String msg = e.getMessage();
                     if (msg != null && msg.contains("403")) {
                         logger.Warning("Flupke CONNECT returned 403 for %s:%d, falling back to Kiche", host, port);
                         logger.Warning("  Flupke error: %s", msg);
-                        try {
-                            flupkeConn.close();
-                        } catch (Exception ignored) {}
+                        try { flupkeConn.close(); } catch (Exception ignored) {}
                         logger.Info("Establishing Kiche fallback WARP connection...");
                         try {
                             WarpConnectionKiche kicheConn = new WarpConnectionKiche(finalConfig, finalSocks5Url, logger);
                             kicheRef.set(kicheConn);
                             delegateRef.set(kicheConn);
-                            return kicheConn.openTunnel(host, port);
+                            return kicheConn.openTunnel(host, port, initialData);
                         } catch (Exception ke) {
                             throw new IOException("Kiche fallback connection failed", ke);
                         }
@@ -115,7 +126,7 @@ public class WarpProvider {
                     throw e;
                 }
             } else if (current instanceof WarpConnectionKiche kicheConn) {
-                return kicheConn.openTunnel(host, port);
+                return kicheConn.openTunnel(host, port, initialData);
             }
             throw new IOException("No active WARP connection");
         };

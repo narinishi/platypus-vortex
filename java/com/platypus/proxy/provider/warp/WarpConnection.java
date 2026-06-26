@@ -2,15 +2,16 @@ package com.platypus.proxy.provider.warp;
 
 import com.platypus.proxy.io.warp.TunnelConnection;
 import com.platypus.proxy.logging.CondLogger;
+import com.platypus.proxy.resolver.LookupNetIP;
+import com.platypus.proxy.resolver.advanced.AdvancedResolver;
 import tech.kwik.core.QuicConnection;
 import tech.kwik.core.QuicStream;
 import tech.kwik.core.QuicClientConnection;
 import tech.kwik.core.generic.VariableLengthInteger;
 import tech.kwik.flupke.Http3Client;
-import tech.kwik.flupke.Http3ClientConnection;
+import tech.kwik.flupke.HttpError;
 import tech.kwik.flupke.HttpStream;
 import tech.kwik.flupke.Http3ClientBuilder;
-import tech.kwik.flupke.impl.Http3ClientConnectionImpl;
 import tech.kwik.flupke.impl.HeadersFrame;
 import tech.kwik.flupke.impl.Http3Frame;
 import tech.kwik.flupke.impl.DataFrame;
@@ -25,8 +26,9 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.http.HttpHeaders;
 import java.nio.ByteBuffer;
@@ -40,7 +42,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -58,8 +59,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 //    v0.10.10 lacks serverName()). quic-go splits SNI from peer address natively.
 // 5. Connection model: Single connection reused for all streams. usque's l4proxy.go
 //    also uses a single connection (l4Proxy.conn). No pooling in either.
-// 6. Stream concurrency: Semaphore(100) here; usque sets MaxIncomingStreams=100 but
-//    the effective limit depends on quic-go defaults and Cloudflare's quiche peer.
+// 6. Stream concurrency: No semaphore — relies on QUIC flow control natively.
+//    usque sets MaxIncomingStreams=100 but the effective limit depends on quic-go
+//    defaults and Cloudflare's quiche peer.
 // 7. Request format: Sends :authority and :method only (no :scheme, no :path), matching
 //    Go http3's request_writer.go exactly. Cloudflare's L4 PROXY endpoint still returns
 //    403 despite all protocol-level matching — suggests TLS fingerprint or QUIC impl
@@ -75,24 +77,19 @@ public class WarpConnection implements AutoCloseable {
     // DIVERGENCE: usque has NO explicit Http3Client analog; the Go http3.Transport
     //             is implicitly kept alive by the connection reference.
     private final Http3Client http3Client;
-    private final Http3ClientConnection h3Connection;
+    private final WarpH3Connection h3Connection;
 
-    // DIVERGENCE: usque has NO explicit stream semaphore. Both quic-go and quiche
-    //             enforce flow control natively (MAX_STREAMS / STREAMS_BLOCKED).
-    //             Kwik/Flupke's flow control feedback loop is unreliable — streams
-    //             block at 150+ concurrent even though Cloudflare advertises 100.
-    //             Semaphore pre-emptively limits to 100 to avoid StreamBlocked.
-    private final Semaphore streamSemaphore = new Semaphore(100, true);
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final CondLogger logger;
+    private final LookupNetIP resolver;
 
     private final QuicConnection quicConn;
     private final Encoder qpackEncoder;
-    private final Method readFrameMethod;
     private final Decoder qpackDecoder;
 
     public WarpConnection(WarpConfig config, String socks5Proxy, CondLogger logger) throws Exception {
         this.logger = logger;
+        this.resolver = new AdvancedResolver(logger);
         long t0 = System.currentTimeMillis();
 
         ECPrivateKey privateKey = config.getPrivateKey();
@@ -159,7 +156,7 @@ public class WarpConnection implements AutoCloseable {
         qBuilder.clientKeyManager(keyManager);
         qBuilder.maxOpenPeerInitiatedUnidirectionalStreams(100);
         qBuilder.maxOpenPeerInitiatedBidirectionalStreams(100);
-        qBuilder.defaultStreamReceiveBufferSize(1_000_000L);
+        qBuilder.defaultStreamReceiveBufferSize(50_000_000L);
         qBuilder.quantumReadinessTest(256);
         quicConn = qBuilder.build();
         logger.Debug("QUIC client connection built");
@@ -189,44 +186,25 @@ public class WarpConnection implements AutoCloseable {
         //             We override Flupke's settings to match exactly.
         //             The server responds with 0x8=1 (SETTINGS_ENABLE_CONNECT_PROTOCOL),
         //             0x33=1 (H3_DATAGRAM), 0x6=32768, 0x276=1, 0x1=0, 0x7=0, plus GREASE.
-        h3Connection = new Http3ClientConnectionImpl(quicConn, h3Exec);
+        h3Connection = new WarpH3Connection(quicConn, h3Exec);
 
         // Replace Flupke's default settings to match quic-go http3 exactly:
         // only SETTINGS_MAX_FIELD_SECTION_SIZE (0x06) = 10 MB, no QPACK settings
-        try {
-            Class<?> baseClass = h3Connection.getClass().getSuperclass();
-            Field sf = baseClass.getDeclaredField("settingsParameters");
-            sf.setAccessible(true);
-            Map<Long, Long> settings = (Map<Long, Long>) sf.get(h3Connection);
-            settings.clear();
-            settings.put(0x06L, 10_485_760L); // SETTINGS_MAX_FIELD_SECTION_SIZE = 10 MB
-        } catch (Exception e) {
-            throw new IOException("Failed to configure SETTINGS", e);
-        }
+        Map<Long, Long> settings = h3Connection.getSettingsParameters();
+        settings.clear();
+        settings.put(0x06L, 10_485_760L); // SETTINGS_MAX_FIELD_SECTION_SIZE = 10 MB
 
         // Log our SETTINGS for debugging
-        try {
-            Class<?> baseClass = h3Connection.getClass().getSuperclass();
-            Field sf = baseClass.getDeclaredField("settingsParameters");
-            sf.setAccessible(true);
-            Map<Long, Long> settings = (Map<Long, Long>) sf.get(h3Connection);
-            StringBuilder sb = new StringBuilder("H3 SETTINGS to send:");
-            for (var e : settings.entrySet()) sb.append(" 0x").append(Long.toHexString(e.getKey())).append("=").append(e.getValue());
-            logger.Debug(sb.toString());
-        } catch (Exception ignored) {}
+        StringBuilder sb = new StringBuilder("H3 SETTINGS to send:");
+        for (var e : settings.entrySet()) sb.append(" 0x").append(Long.toHexString(e.getKey())).append("=").append(e.getValue());
+        logger.Debug(sb.toString());
 
         h3Connection.connect();
 
         // Log server SETTINGS received from Cloudflare (wait for latch)
         try {
-            Class<?> baseClass = h3Connection.getClass().getSuperclass();
-            Field latchField = baseClass.getDeclaredField("settingsFrameReceived");
-            latchField.setAccessible(true);
-            java.util.concurrent.CountDownLatch latch = (java.util.concurrent.CountDownLatch) latchField.get(h3Connection);
-            latch.await(10, TimeUnit.SECONDS);
-            Field psf = baseClass.getDeclaredField("peerSettingsParameters");
-            psf.setAccessible(true);
-            Map<Long, Long> peerSettings = (Map<Long, Long>) psf.get(h3Connection);
+            h3Connection.getSettingsFrameReceived().await(10, TimeUnit.SECONDS);
+            Map<Long, Long> peerSettings = h3Connection.getPeerSettingsParameters();
             StringBuilder peerSb = new StringBuilder("Server SETTINGS received:");
             for (var e : peerSettings.entrySet()) peerSb.append(" 0x").append(Long.toHexString(e.getKey())).append("=").append(e.getValue());
             logger.Debug(peerSb.toString());
@@ -249,10 +227,7 @@ public class WarpConnection implements AutoCloseable {
         }
 
         try {
-            Class<?> baseClass = h3Connection.getClass().getSuperclass();
-            Field ef = baseClass.getDeclaredField("qpackEncoder");
-            ef.setAccessible(true);
-            qpackEncoder = (Encoder) ef.get(h3Connection);
+            qpackEncoder = h3Connection.getQpackEncoder();
 
             // Log encoder dynamic table state
             Field dynTableField = qpackEncoder.getClass().getDeclaredField("dynamicTable");
@@ -260,9 +235,7 @@ public class WarpConnection implements AutoCloseable {
             List<?> dynTable = (List<?>) dynTableField.get(qpackEncoder);
             logger.Debug("QPACK encoder: dynamicTable.size=%d", dynTable.size());
 
-            Field decoderField = baseClass.getDeclaredField("qpackDecoder");
-            decoderField.setAccessible(true);
-            this.qpackDecoder = (Decoder) decoderField.get(h3Connection);
+            this.qpackDecoder = h3Connection.getQpackDecoder();
             Field decDynTableField = this.qpackDecoder.getClass().getDeclaredField("dynamicTable");
             decDynTableField.setAccessible(true);
             List<?> decDynTable = (List<?>) decDynTableField.get(qpackDecoder);
@@ -272,14 +245,32 @@ public class WarpConnection implements AutoCloseable {
             logger.Debug("QPACK: peer QPACK_MAX_TABLE_CAPACITY=%d, peer QPACK_BLOCKED_STREAMS=%d",
                     h3Connection.getPeerSettingsParameter(0x01L).orElse(-1L),
                     h3Connection.getPeerSettingsParameter(0x07L).orElse(-1L));
-
-            readFrameMethod = baseClass.getDeclaredMethod("readFrame", InputStream.class);
-            readFrameMethod.setAccessible(true);
         } catch (Exception e) {
             throw new IOException("Failed to access Flupke internals", e);
         }
 
         logger.Info("Flupke H3 connection ready (total init: %dms)", System.currentTimeMillis() - t0);
+
+        try {
+            Class<?> cls = Class.forName("tech.kwik.core.stream.StreamInputStreamImpl");
+            MethodHandles.Lookup privileged = MethodHandles.privateLookupIn(cls, MethodHandles.lookup());
+            MethodHandle setter = privileged.findStaticSetter(cls, "waitForNextFrameTimeout", long.class);
+            setter.invoke(10_000L);
+            logger.Debug("Set kwik stream read timeout to 10s");
+        } catch (Throwable e) {
+            logger.Debug("Could not set kwik read timeout: %s", e.getMessage());
+        }
+
+        // Enable QUIC-level keep-alive PING to prevent WARP edge from closing the
+        // connection due to idle timeout. Kwik sends PING frames at half the peer's
+        // idle timeout interval (60s/2 = 30s). This does NOT prevent per-stream
+        // data stalls but keeps the H3 connection alive for pool reuse.
+        try {
+            ((QuicClientConnection) quicConn).keepAlive(30);
+            logger.Debug("QUIC keep-alive PING enabled (30s)");
+        } catch (Exception e) {
+            logger.Debug("Could not enable QUIC keep-alive: %s", e.getMessage());
+        }
     }
 
     // DIVERGENCE: usque's http3.Response.Body returns raw bytes directly (the QUIC
@@ -337,48 +328,72 @@ public class WarpConnection implements AutoCloseable {
     //             The Kiche fallback (WarpConnectionKiche) follows the same pattern
     //             and succeeds. Match Kiche's exact request format here.
     public TunnelConnection openTunnel(String targetHost, int targetPort) throws IOException {
+        return openTunnel(targetHost, targetPort, null);
+    }
+
+    public TunnelConnection openTunnel(String targetHost, int targetPort, byte[] initialData) throws IOException {
         if (closed.get()) throw new IOException("WARP connection closed");
 
-        // Resolve target to IP locally, matching usque resolveLocally=true and Kiche
-        java.net.InetAddress resolved;
+        // Resolve target to IP locally. Cloudflare's MASQUE service requires the
+        // resolved IP in :authority (the hostname gives 403). The third-party WARP
+        // client does the same (resolveLocally=true in usque's l4proxy.go).
+        java.util.List<java.net.InetAddress> addresses;
         try {
-            // LEAK: per-tunnel system DNS resolution; not cached. Each openTunnel
-            //       call triggers a fresh DNS lookup. Use TcpConnector resolver or
-            //       Java DNS cache (networkaddress.cache.ttl) for dedup.
-            resolved = java.net.InetAddress.getByName(targetHost);
+            addresses = resolver.lookup(targetHost);
         } catch (Exception e) {
             throw new IOException("DNS resolution failed for " + targetHost, e);
         }
-        String authority = resolved.getHostAddress() + ":" + targetPort;
-        logger.Debug("openTunnel: CONNECT :authority=%s (resolved from %s)", authority, targetHost);
-
-        try {
-            if (!streamSemaphore.tryAcquire(60, TimeUnit.SECONDS)) {
-                throw new IOException("CONNECT tunnel to " + authority + " failed: stream backpressure timeout");
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted waiting for stream creation permit");
+        if (addresses.isEmpty()) {
+            throw new IOException("DNS resolution returned no addresses for " + targetHost);
         }
+        // Use the first address (AdvancedResolver returns both A and AAAA; prefer IPv6 per Happy Eyeballs).
+        java.net.InetAddress resolved = addresses.get(0);
+        // Prefer IPv6 over IPv4 for Happy Eyeballs compatibility.
+        for (java.net.InetAddress addr : addresses) {
+            if (addr.getAddress().length == 16) { resolved = addr; break; }
+        }
+        String ipStr = resolved.getHostAddress();
+        // IPv6 addresses must be bracketed per RFC 3986 in the :authority pseudo-header.
+        if (ipStr.contains(":")) ipStr = "[" + ipStr + "]";
+        String authority = ipStr + ":" + targetPort;
+        logger.Debug("openTunnel: CONNECT :authority=%s (resolved from %s; IPv%d)", authority, targetHost,
+                resolved.getAddress().length == 16 ? 6 : 4);
 
-        // Build CONNECT matching Kiche's exact format (which succeeds):
-        // :method=CONNECT, :scheme=https, :authority=IP:port, :path=/
-        // No extra headers (no user-agent).
+        // Build CONNECT with only :method and :authority pseudo-headers.
+        //
+        // Cloudflare's WARP MASQUE edge accepts these two headers alone and
+        // correctly routes tunnel data through them.  Additional pseudo-headers
+        // such as :scheme and :path are NOT required — the edge treats CONNECT
+        // as a tunnel method regardless of scheme/path, and adding them triggered
+        // per-stream data throttling that cut off DATA-frame delivery after
+        // roughly 20–50 KB per tunnel.
+        //
+        // usque's l4proxy.go inserts :scheme=https and :path=/ automatically
+        // because it uses Go's http.NewRequest("CONNECT", "https://"+target, nil),
+        // which the standard library adds unconditionally.  That is a Go-idiom
+        // artefact, not a WARP-edge requirement.  We omit them deliberately.
         Map<String, String> pseudoHeaders = new LinkedHashMap<>();
         pseudoHeaders.put(":method", "CONNECT");
-        pseudoHeaders.put(":scheme", "https");
         pseudoHeaders.put(":authority", authority);
-        pseudoHeaders.put(":path", "/");
-        logger.Debug("CONNECT pseudo-headers: :method=CONNECT :scheme=https :authority=%s :path=/", authority);
+        logger.Debug("CONNECT pseudo-headers: :method=CONNECT :authority=%s", authority);
 
         HttpHeaders extraHeaders = HttpHeaders.of(Map.of(), (a, b) -> true);
         logger.Debug("CONNECT extra headers: (none)");
 
         HeadersFrame headersFrame = new HeadersFrame(extraHeaders, pseudoHeaders);
 
-        QuicStream httpStream = quicConn.createStream(true);
+        QuicStream httpStream;
         try {
-            byte[] reqBytes = headersFrame.toBytes(qpackEncoder);
+            httpStream = quicConn.createStream(true);
+        } catch (Exception e) {
+            logger.Debug("openTunnel: createStream failed: %s: %s", e.getClass().getSimpleName(), e.getMessage());
+            throw new IOException("Failed to create QUIC stream: " + e.getMessage(), e);
+        }
+        try {
+            byte[] reqBytes;
+            synchronized (qpackEncoder) {
+                reqBytes = headersFrame.toBytes(qpackEncoder);
+            }
             // Split frame header vs QPACK payload for clearer logging
             int payloadVarintLen = 1;
             if (reqBytes.length > 1) {
@@ -395,9 +410,9 @@ public class WarpConnection implements AutoCloseable {
             for (int i = Math.min(hdrLen, reqBytes.length); i < reqBytes.length; i++) qpackHex.append(String.format("%02X ", reqBytes[i]));
             logger.Debug("CONNECT request: frame hdr=%s", frameHex.toString().trim());
             logger.Debug("CONNECT request: QPACK (%d bytes)=%s", reqBytes.length - Math.min(hdrLen, reqBytes.length), qpackHex.toString().trim());
-            httpStream.getOutputStream().write(reqBytes);
+            OutputStream qOs = httpStream.getOutputStream();
+            qOs.write(reqBytes); // CONNECT headers only — initial data sent after :status=200
         } catch (Exception e) {
-            streamSemaphore.release();
             throw new IOException("Failed to send CONNECT request", e);
         }
 
@@ -426,13 +441,11 @@ public class WarpConnection implements AutoCloseable {
                     String statusStr = heads.getPseudoHeader(":status");
                     if (statusStr == null || statusStr.isEmpty()) {
                         httpStream.resetStream(0x010eL);
-                        streamSemaphore.release();
                         throw new IOException("CONNECT response missing :status pseudo-header");
                     }
                     int statusCode = Integer.parseInt(statusStr);
                     if (statusCode < 200 || statusCode >= 300) {
                         httpStream.resetStream(0x010eL);
-                        streamSemaphore.release();
                         throw new IOException("CONNECT to " + authority + " failed: HTTP " + statusCode);
                     }
                     logger.Debug("openTunnel: CONNECT to %s succeeded on stream %d", authority, httpStream.getStreamId());
@@ -440,30 +453,39 @@ public class WarpConnection implements AutoCloseable {
                 }
                 if (responseFrame instanceof DataFrame) {
                     httpStream.resetStream(0x010eL);
-                    streamSemaphore.release();
                     throw new IOException("CONNECT response: unexpected DATA frame before HEADERS");
                 }
                 if (responseFrame == null) {
                     httpStream.resetStream(0x010eL);
-                    streamSemaphore.release();
                     throw new IOException("CONNECT response: stream closed, no HEADERS frame");
                 }
-                logger.Debug("openTunnel: skipping frame type=%s (attempt %d/%d)",
+                // UnknownFrame = GREASE — don't count against retry budget
+                if (responseFrame instanceof UnknownFrame) {
+                    logger.Debug("openTunnel: skipping GREASE frame (%s)", responseFrame.getClass().getSimpleName());
+                    attempt--;
+                    continue;
+                }
+                logger.Debug("openTunnel: skipping unexpected frame type=%s (attempt %d/%d)",
                         responseFrame.getClass().getSimpleName(), attempt, maxAttempts);
             }
             if (responseFrame == null || !(responseFrame instanceof HeadersFrame)) {
                 httpStream.resetStream(0x010eL);
-                streamSemaphore.release();
                 throw new IOException("CONNECT response: no HEADERS frame after " + maxAttempts + " attempts");
             }
-        } catch (IOException e) {
-            streamSemaphore.release();
-            throw e;
         } catch (Exception e) {
             Throwable cause = e.getCause();
             if (cause instanceof IOException) throw (IOException) cause;
-            streamSemaphore.release();
             throw new IOException("Failed to read CONNECT response", cause != null ? cause : e);
+        }
+
+        // Send initial data AFTER tunnel is established (separate DATA frame after :status=200)
+        if (initialData != null && initialData.length > 0) {
+            try {
+                new DataFrame(ByteBuffer.wrap(initialData)).writeTo(httpStream.getOutputStream());
+                logger.Debug("openTunnel: sent %d bytes initial data after CONNECT response", initialData.length);
+            } catch (Exception e) {
+                throw new IOException("Failed to send initial data after tunnel established", e);
+            }
         }
 
         HttpStream tunnel = wrapDataFrameStream(httpStream);
@@ -472,15 +494,18 @@ public class WarpConnection implements AutoCloseable {
                 tunnel.getOutputStream(),
                 () -> {
                     try { httpStream.resetStream(0x010fL); } catch (Exception ignored) {}
-                    streamSemaphore.release();
+                },
+                () -> {
+                    try { httpStream.abortReading(0x010fL); } catch (Exception ignored) {}
                 });
     }
 
     private HttpStream wrapDataFrameStream(QuicStream stream) {
+        long qsId = stream.getStreamId();
         return new HttpStream() {
             @Override
             public OutputStream getOutputStream() {
-                return new BufferedDataFrameOutputStream(stream.getOutputStream(), 65536);
+                return new BufferedDataFrameOutputStream(stream.getOutputStream(), 65536, qsId, logger);
             }
 
             @Override
@@ -507,24 +532,34 @@ public class WarpConnection implements AutoCloseable {
                     }
 
                     private boolean readData() throws IOException {
-                        try {
-                            Http3Frame frame = (Http3Frame) readFrameMethod.invoke(h3Connection, stream.getInputStream());
-                            if (frame instanceof DataFrame dataFrame) {
-                                dataBuffer = ByteBuffer.wrap(dataFrame.getPayload());
-                                return true;
+                        while (true) {
+                            try {
+                                long t0 = System.nanoTime();
+                                Http3Frame frame = h3Connection.readFramePublic(stream.getInputStream());
+                                long elapsed = (System.nanoTime() - t0) / 1000000;
+                                if (logger != null) logger.Debug("Tunnel qs=%d readData (blocked %dms): got %s", qsId, elapsed, frame != null ? frame.getClass().getSimpleName() : "null");
+                                if (frame == null) return false;
+                                if (frame instanceof DataFrame dataFrame) {
+                                    byte[] payload = dataFrame.getPayload();
+                                    if (logger != null) logger.Debug("Tunnel qs=%d readData: DataFrame size=%d", qsId, payload.length);
+                                    dataBuffer = ByteBuffer.wrap(payload);
+                                    return true;
+                                }
+                                if (logger != null) logger.Debug("Tunnel qs=%d readData: skipping %s, continuing", qsId, frame.getClass().getSimpleName());
+                            } catch (HttpError e) {
+                                throw new IOException("Failed to read DATA frame", e);
+                            } catch (Exception e) {
+                                Throwable cause = e.getCause();
+                                if (cause instanceof IOException) throw (IOException) cause;
+                                throw new IOException("Failed to read DATA frame", cause != null ? cause : e);
                             }
-                            return false;
-                        } catch (Exception e) {
-                            Throwable cause = e.getCause();
-                            if (cause instanceof IOException) throw (IOException) cause;
-                            throw new IOException("Failed to read DATA frame", cause != null ? cause : e);
                         }
                     }
                 };
             }
 
             @Override
-            public long getStreamId() { return stream.getStreamId(); }
+            public long getStreamId() { return qsId; }
             @Override
             public boolean isBidirectional() { return true; }
             @Override
@@ -537,6 +572,9 @@ public class WarpConnection implements AutoCloseable {
     @Override
     public void close() {
         closed.set(true);
+        if (resolver instanceof AutoCloseable c) {
+            try { c.close(); } catch (Exception ignored) {}
+        }
     }
 
     // Buffered output stream that coalesces small writes into larger DATA frames.
@@ -545,10 +583,14 @@ public class WarpConnection implements AutoCloseable {
         private final OutputStream quicStream;
         private final byte[] buffer;
         private int count;
+        private final long qsId;
+        private final CondLogger log;
 
-        BufferedDataFrameOutputStream(OutputStream quicStream, int bufferSize) {
+        BufferedDataFrameOutputStream(OutputStream quicStream, int bufferSize, long qsId, CondLogger log) {
             this.quicStream = quicStream;
             this.buffer = new byte[bufferSize];
+            this.qsId = qsId;
+            this.log = log;
         }
 
         @Override
@@ -559,17 +601,16 @@ public class WarpConnection implements AutoCloseable {
 
         @Override
         public void write(byte[] b, int off, int len) throws IOException {
-            // Flush any partially-buffered single-byte writes first
             if (count > 0) flushBuffer();
-            // Send large writes directly as a single DataFrame (skip buffer copy)
             if (len <= buffer.length) {
+                if (log != null) log.Debug("BDFOS qs=%d write %d bytes to quicStream", qsId, len);
                 new DataFrame(ByteBuffer.wrap(b, off, len)).writeTo(quicStream);
             } else {
-                // For writes larger than buffer size, chunk at buffer granularity
                 int remaining = len;
                 int offset = off;
                 while (remaining > 0) {
                     int chunk = Math.min(remaining, buffer.length);
+                    if (log != null) log.Debug("BDFOS qs=%d write chunk %d bytes to quicStream", qsId, chunk);
                     new DataFrame(ByteBuffer.wrap(b, offset, chunk)).writeTo(quicStream);
                     offset += chunk;
                     remaining -= chunk;
@@ -580,6 +621,7 @@ public class WarpConnection implements AutoCloseable {
         @Override
         public void flush() throws IOException {
             if (count > 0) flushBuffer();
+            if (log != null) log.Debug("BDFOS qs=%d flush", qsId);
             quicStream.flush();
         }
 
@@ -590,6 +632,7 @@ public class WarpConnection implements AutoCloseable {
         }
 
         private void flushBuffer() throws IOException {
+            if (log != null) log.Debug("BDFOS qs=%d flushBuffer %d buffered bytes", qsId, count);
             new DataFrame(ByteBuffer.wrap(buffer, 0, count)).writeTo(quicStream);
             count = 0;
         }

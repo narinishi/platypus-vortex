@@ -503,6 +503,10 @@ public class WarpConnectionKiche implements AutoCloseable {
     }
 
     public TunnelConnection openTunnel(String targetHost, int targetPort) throws IOException {
+        return openTunnel(targetHost, targetPort, null);
+    }
+
+    public TunnelConnection openTunnel(String targetHost, int targetPort, byte[] initialData) throws IOException {
         if (closed.get()) throw new IOException("Kiche WARP connection closed");
 
         // Resolve target to IP locally (matches usque L4 proxy resolveLocally=true)
@@ -514,7 +518,9 @@ public class WarpConnectionKiche implements AutoCloseable {
         } catch (Exception e) {
             throw new IOException("DNS resolution failed for " + targetHost, e);
         }
-        String authority = resolved.getHostAddress() + ":" + targetPort;
+        String ipStr = resolved.getHostAddress();
+        if (ipStr.contains(":")) ipStr = "[" + ipStr + "]";
+        String authority = ipStr + ":" + targetPort;
         logger.Debug("Kiche openTunnel: CONNECT :authority=%s (resolved from %s)", authority, targetHost);
 
         // Include :scheme and :path — usque L4 sends them, and Cloudflare
@@ -560,6 +566,14 @@ public class WarpConnectionKiche implements AutoCloseable {
             }
         }
         logger.Debug("Kiche openTunnel: CONNECT request sent on stream %d", streamId);
+
+        // Send initial data with CONNECT request, before waiting for response
+        if (initialData != null && initialData.length > 0) {
+            synchronized (quicLock) {
+                h3Connection.sendBody(quicConnection, streamId, initialData, false);
+            }
+            logger.Debug("Kiche openTunnel: sent %d bytes initial data w/ CONNECT", initialData.length);
+        }
 
         H3StreamState state = registerStream(streamId);
         try {
